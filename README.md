@@ -13,6 +13,26 @@ krisha --help
 
 Requires Python 3.11+.
 
+## Rate-limiting & IP bans
+
+Krisha will block your IP if you hammer the site. The CLI ships with
+**polite defaults** that have worked reliably for me:
+
+- `--concurrency 2` — at most two in-flight requests.
+- `--min-interval 1.0` — ≥1 s between request *starts*, with ±30 % jitter,
+  enforced globally across all concurrent tasks.
+- Browser-like `User-Agent`, HTTP/1.1 with keep-alive.
+- Retry with exponential backoff (max 60 s) on `429` and `5xx`.
+- A `403` aborts immediately with a clear message (retrying a ban won't help).
+
+**If you get blocked:**
+
+1. Wait a few hours.
+2. Re-run with a proxy: `--proxy http://user:pass@host:port` (also reads
+   `KRISHA_PROXY` and `HTTPS_PROXY` env vars).
+3. Lower throughput further: `--concurrency 1 --min-interval 2`.
+4. Optionally override the UA: `--user-agent "Mozilla/5.0 …"`.
+
 ## Commands
 
 ### `krisha show <id>`
@@ -42,12 +62,16 @@ krisha search prodazha/kvartiry \
   --pages 1-5 \
   -o almaty-2k.jsonl
 
-# Astana rentals, all pages
-krisha search arenda/kvartiry --city astana --rooms 2 --pages all -o rentals.jsonl
+# Astana rentals, all pages, behind a proxy, extra slow
+krisha search arenda/kvartiry --city astana --rooms 2 --pages all \
+  --min-interval 2 --proxy http://localhost:8888 -o rentals.jsonl
 
 # With full ad details merged in (one /a/show fetch per result)
 krisha search prodazha/kvartiry --city almaty --rooms 1 --pages 1 --enrich
 ```
+
+Total request count for `search`: `pages` (with `--enrich`: `pages × (1 + cards_per_page)`).
+Plan accordingly given the default 1 s spacing.
 
 #### Filters
 
@@ -66,6 +90,17 @@ krisha search prodazha/kvartiry --city almaty --rooms 1 --pages 1 --enrich
 | `--mortgage/--no-mortgage` | `das[mortgage]` | |
 | `--floor-not-first/--floor-not-last` | matching `das[...]` | |
 | `--das KEY=VALUE` | escape hatch | e.g. `--das flat.toilet=2` |
+
+#### Networking flags (both commands)
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--concurrency` / `-c` | `2` (search) / `1` (show) | max in-flight requests |
+| `--min-interval` | `1.0` s | global gap between request starts, ±30 % jitter |
+| `--retries` | `4` | retries on `429` / `5xx` / network errors |
+| `--timeout` | `30.0` s | per-request HTTP timeout |
+| `--proxy` | — | HTTP/SOCKS URL; also reads `KRISHA_PROXY`, `HTTPS_PROXY` |
+| `--user-agent` | Chrome on macOS | override default UA |
 
 Run `krisha search --help` for the full list.
 
@@ -88,18 +123,15 @@ krisha search prodazha/kvartiry --city almaty --pages 1 | \
 - All endpoints accessed (`/prodazha/*`, `/a/show/*`) are **not** in
   `robots.txt`. Phone numbers (`/a/ajaxPhones`) require a logged-in session
   and are not implemented.
-- View counts on listing cards are populated client-side via a robots-disallowed
-  endpoint, so `views` is `null` for `search` results.
-- HTTP/2 + keep-alive + `-c 16` concurrency by default ("aggressive" mode).
-  Lower with `--concurrency` if you see `429` or `ConnectTimeout`.
-- See [PLAN.md](PLAN.md) for the design rationale and full filter inventory.
+- View counts on listing cards are populated client-side via a
+  robots-disallowed endpoint, so `views` is `null` for `search` results.
 
 ## Project layout
 
 ```
 src/krisha/
 ├── cli.py         # Typer commands
-├── client.py      # httpx async wrapper, retries
+├── client.py      # httpx async wrapper, rate limiter, retries
 ├── urls.py        # SearchFilters → URL
 ├── parse_list.py  # listing-page HTML → ListingCard
 ├── parse_show.py  # ad-page HTML → AdDetail (extracts window.data)

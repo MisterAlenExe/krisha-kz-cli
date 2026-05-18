@@ -49,18 +49,64 @@ async def _show_one(client: KrishaClient, ad_id: int):
     return parse_show(html, ad_id)
 
 
+# ----- shared rate-limit/networking flags ---------------------------------
+
+ConcurrencyOpt = Annotated[
+    int,
+    typer.Option(
+        "--concurrency",
+        "-c",
+        min=1,
+        max=16,
+        help="Max in-flight requests (default 2; raise carefully).",
+    ),
+]
+MinIntervalOpt = Annotated[
+    float,
+    typer.Option(
+        "--min-interval",
+        min=0.0,
+        help="Minimum gap between request starts, in seconds (±30%% jitter).",
+    ),
+]
+RetriesOpt = Annotated[int, typer.Option("--retries", help="HTTP retries per request")]
+TimeoutOpt = Annotated[float, typer.Option("--timeout", help="HTTP timeout (s)")]
+ProxyOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--proxy",
+        help="HTTP/SOCKS proxy URL (also reads KRISHA_PROXY / HTTPS_PROXY).",
+    ),
+]
+UserAgentOpt = Annotated[
+    str | None,
+    typer.Option("--user-agent", help="Override the default User-Agent header."),
+]
+
+
 @app.command()
 def show(
     ad_id: Annotated[int, typer.Argument(help="Krisha advert ID (e.g. 1009233693)")],
     output: Annotated[
         str, typer.Option("--output", "-o", help="Output file (default: stdout)")
     ] = "-",
-    timeout: Annotated[float, typer.Option(help="HTTP timeout (s)")] = 20.0,
+    min_interval: MinIntervalOpt = 1.0,
+    retries: RetriesOpt = 4,
+    timeout: TimeoutOpt = 30.0,
+    proxy: ProxyOpt = None,
+    user_agent: UserAgentOpt = None,
 ) -> None:
     """Fetch one advert by ID and emit its full structured JSON record."""
 
     async def run() -> int:
-        async with KrishaClient(concurrency=1, timeout=timeout) as client:
+        async with KrishaClient(
+            concurrency=1,
+            min_interval=min_interval,
+            retries=retries,
+            timeout=timeout,
+            proxy=proxy,
+            user_agent=user_agent,
+        ) as client:
             ad = await _show_one(client, ad_id)
             with open_output(output) as out:
                 write_jsonl(out, ad)
@@ -117,7 +163,6 @@ def search(
     pages: Annotated[
         str, typer.Option("--pages", help="Page range: '5', '2-7', or 'all'.")
     ] = "1",
-    concurrency: Annotated[int, typer.Option("--concurrency", "-c")] = 16,
     enrich: Annotated[
         bool,
         typer.Option(
@@ -126,17 +171,26 @@ def search(
         ),
     ] = False,
     output: Annotated[str, typer.Option("--output", "-o")] = "-",
-    retries: Annotated[int, typer.Option(help="HTTP retries per request")] = 3,
-    timeout: Annotated[float, typer.Option(help="HTTP timeout (s)")] = 20.0,
+    concurrency: ConcurrencyOpt = 2,
+    min_interval: MinIntervalOpt = 1.0,
+    retries: RetriesOpt = 4,
+    timeout: TimeoutOpt = 30.0,
+    proxy: ProxyOpt = None,
+    user_agent: UserAgentOpt = None,
 ) -> None:
     """Run a paginated krisha search and emit one JSONL record per listing.
+
+    Defaults are conservative (2 concurrent requests, 1 s between starts)
+    to avoid IP bans. Raise --concurrency / lower --min-interval at your
+    own risk.
 
     Examples:
 
         krisha search prodazha/kvartiry --city almaty --rooms 2 \\
             --price-from 20000000 --price-to 40000000 --pages 1-5
 
-        krisha search arenda/kvartiry --city astana --has-photo --pages all
+        krisha search arenda/kvartiry --city astana --has-photo --pages all \\
+            --min-interval 2 --proxy http://user:pass@proxy:8080
     """
     if "/" not in target:
         raise typer.BadParameter("TARGET must be '<section>/<category>'")
@@ -178,8 +232,14 @@ def search(
 
     async def run() -> int:
         emitted = 0
-        async with KrishaClient(concurrency=concurrency, retries=retries, timeout=timeout) as client:
-            # First page tells us how many to fetch under --pages all
+        async with KrishaClient(
+            concurrency=concurrency,
+            retries=retries,
+            timeout=timeout,
+            min_interval=min_interval,
+            proxy=proxy,
+            user_agent=user_agent,
+        ) as client:
             first_url = filters.page_url(start_page)
             html = await client.get_text(first_url)
             cards = parse_listing_page(html, start_page)
@@ -191,13 +251,20 @@ def search(
                     math.ceil(total / ADS_PER_PAGE) if total else start_page
                 )
                 print(
-                    f"[search] {total or '?'} matches; fetching pages {start_page}-{resolved_end}",
+                    f"[search] {total or '?'} matches; fetching pages "
+                    f"{start_page}-{resolved_end} (concurrency={concurrency}, "
+                    f"min-interval={min_interval}s)",
                     file=sys.stderr,
                 )
 
             with open_output(output) as out:
 
                 async def emit(card_records: list) -> int:
+                    """Write a page's cards (and, with --enrich, their /a/show records).
+
+                    All requests go through the same rate-limited client, so
+                    even with --enrich we don't burst N requests at once.
+                    """
                     if enrich and card_records:
                         details = await asyncio.gather(
                             *(_show_one(client, c.id) for c in card_records),
@@ -222,7 +289,8 @@ def search(
 
                 emitted += await emit(cards)
 
-                # Remaining pages concurrently
+                # Remaining pages — submitted concurrently but the client's
+                # global rate limiter still spaces them by --min-interval.
                 remaining = list(range(start_page + 1, resolved_end + 1))
                 if remaining:
                     htmls = await asyncio.gather(
