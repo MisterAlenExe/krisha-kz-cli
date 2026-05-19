@@ -5,21 +5,39 @@ import math
 import sys
 from typing import Annotated
 
+import httpx
 import typer
 
-from .client import KrishaClient
+from .api import ApiClient, KrishaApi, SearchFilters
+from .api.constants import CATEGORY_IDS, PAGE_SIZE, REGION_IDS
+from .api.search import BUILDING_TYPES
 from .output import open_output, write_jsonl
-from .parse_list import parse_listing_page, parse_total_count
-from .parse_show import parse_show
-from .urls import BUILDING_TYPES, SearchFilters
+
+
+def _run(coro) -> int:
+    """Run an async CLI handler with clean error reporting.
+
+    Turns common HTTP/network errors into one-line stderr messages
+    instead of dumping a full Python traceback.
+    """
+    try:
+        return asyncio.run(coro)
+    except httpx.HTTPStatusError as e:
+        print(
+            f"error: {e.response.status_code} {e.response.reason_phrase} "
+            f"for {e.request.url}",
+            file=sys.stderr,
+        )
+        return 1
+    except httpx.HTTPError as e:
+        print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
 
 app = typer.Typer(
     add_completion=False,
-    help="Extract real-estate listings from krisha.kz.",
+    help="Extract real-estate listings from krisha.kz via the mobile JSON API.",
     no_args_is_help=True,
 )
-
-ADS_PER_PAGE = 20  # observed: ~20 organic .a-card per page
 
 
 def _parse_pages(spec: str) -> tuple[int, int | None]:
@@ -34,19 +52,35 @@ def _parse_pages(spec: str) -> tuple[int, int | None]:
     return 1, n
 
 
-def _parse_das_overrides(raw: list[str]) -> dict[str, str]:
+def _parse_extras(raw: list[str]) -> dict[str, str]:
     out: dict[str, str] = {}
     for item in raw:
         if "=" not in item:
-            raise typer.BadParameter(f"--das expects KEY=VALUE, got {item!r}")
+            raise typer.BadParameter(f"--extra expects KEY=VALUE, got {item!r}")
         k, v = item.split("=", 1)
         out[k.strip()] = v.strip()
     return out
 
 
-async def _show_one(client: KrishaClient, ad_id: int):
-    html = await client.get_text(f"/a/show/{ad_id}")
-    return parse_show(html, ad_id)
+def _resolve_cat_id(target: str) -> int:
+    """Accept either a numeric id ("1") or a name ("sell.flat")."""
+    target = target.strip()
+    if target.isdigit():
+        return int(target)
+    if target not in CATEGORY_IDS:
+        known = ", ".join(sorted(CATEGORY_IDS))
+        raise typer.BadParameter(f"unknown category {target!r}. Known: {known}")
+    return CATEGORY_IDS[target]
+
+
+def _resolve_region_id(region: str) -> int:
+    region = region.strip().lower()
+    if region.isdigit():
+        return int(region)
+    if region not in REGION_IDS:
+        known = ", ".join(sorted(REGION_IDS))
+        raise typer.BadParameter(f"unknown region {region!r}. Known: {known}")
+    return REGION_IDS[region]
 
 
 # ----- shared rate-limit/networking flags ---------------------------------
@@ -78,10 +112,6 @@ ProxyOpt = Annotated[
         help="HTTP/SOCKS proxy URL (also reads KRISHA_PROXY / HTTPS_PROXY).",
     ),
 ]
-UserAgentOpt = Annotated[
-    str | None,
-    typer.Option("--user-agent", help="Override the default User-Agent header."),
-]
 
 
 @app.command()
@@ -94,39 +124,45 @@ def show(
     retries: RetriesOpt = 4,
     timeout: TimeoutOpt = 30.0,
     proxy: ProxyOpt = None,
-    user_agent: UserAgentOpt = None,
 ) -> None:
-    """Fetch one advert by ID and emit its full structured JSON record."""
+    """Fetch one advert by ID and emit its full JSON record."""
 
     async def run() -> int:
-        async with KrishaClient(
+        async with ApiClient(
             concurrency=1,
             min_interval=min_interval,
             retries=retries,
             timeout=timeout,
             proxy=proxy,
-            user_agent=user_agent,
         ) as client:
-            ad = await _show_one(client, ad_id)
+            api = KrishaApi(client)
+            ad = await api.show(ad_id)
             with open_output(output) as out:
                 write_jsonl(out, ad)
         return 0
 
-    raise typer.Exit(asyncio.run(run()))
+    raise typer.Exit(_run(run()))
 
 
 @app.command()
 def search(
-    target: Annotated[
+    category: Annotated[
         str,
         typer.Argument(
-            help="<section>/<category>, e.g. prodazha/kvartiry or arenda/kvartiry"
+            help="Category id or name (sell.flat, rent.flat, sell.house_dacha, ...).",
         ),
     ],
-    city: Annotated[str, typer.Option(help="City slug (almaty, astana, …)")] = "almaty",
+    region: Annotated[
+        str,
+        typer.Option("--region", help="Region id or name (almaty, astana, ...)."),
+    ] = "almaty",
+    geo_id: Annotated[
+        list[int] | None,
+        typer.Option("--geo-id", help="District / microdistrict id (repeatable)."),
+    ] = None,
     rooms: Annotated[
         list[int] | None,
-        typer.Option("--rooms", help="Room count (repeatable)"),
+        typer.Option("--rooms", help="Room count (repeatable)."),
     ] = None,
     price_from: Annotated[int | None, typer.Option("--price-from")] = None,
     price_to: Annotated[int | None, typer.Option("--price-to")] = None,
@@ -143,9 +179,23 @@ def search(
             help=f"Building type (repeatable). One of: {', '.join(BUILDING_TYPES)}",
         ),
     ] = None,
+    renovation: Annotated[
+        list[int] | None,
+        typer.Option("--renovation", help="flat.renovation value (repeatable)."),
+    ] = None,
     has_photo: Annotated[bool, typer.Option("--has-photo")] = False,
     new_build: Annotated[bool, typer.Option("--new-build")] = False,
-    from_owner: Annotated[bool, typer.Option("--from-owner")] = False,
+    from_owner: Annotated[
+        bool,
+        typer.Option(
+            "--from-owner",
+            help=(
+                "Exclude type-2 agents. Note: 'builder' accounts (e.g. БИ "
+                "Group sellers) are kept — this is NOT a private-individual-"
+                "only filter."
+            ),
+        ),
+    ] = False,
     from_agent: Annotated[bool, typer.Option("--from-agent")] = False,
     mortgage: Annotated[
         bool | None,
@@ -153,13 +203,21 @@ def search(
     ] = None,
     floor_not_first: Annotated[bool, typer.Option("--floor-not-first")] = False,
     floor_not_last: Annotated[bool, typer.Option("--floor-not-last")] = False,
-    das: Annotated[
+    text: Annotated[
+        str | None, typer.Option("--text", help="Free-text query.")
+    ] = None,
+    extra: Annotated[
         list[str] | None,
         typer.Option(
-            "--das",
-            help="Raw das override, e.g. --das flat.toilet=2 (repeatable).",
+            "--extra",
+            help="Raw filter override, e.g. --extra flat.toilet=2 (repeatable).",
         ),
     ] = None,
+    order_by: Annotated[
+        str,
+        typer.Option("--order-by", help="add_date | _sys.price-2 | hot"),
+    ] = "add_date",
+    sort: Annotated[str, typer.Option("--sort", help="asc | desc")] = "desc",
     pages: Annotated[
         str, typer.Option("--pages", help="Page range: '5', '2-7', or 'all'.")
     ] = "1",
@@ -167,7 +225,11 @@ def search(
         bool,
         typer.Option(
             "--enrich",
-            help="Fetch /a/show/{id} for each hit and merge full ad details.",
+            help=(
+                "Fetch full /v1/a/show for each hit. Adds analytics, "
+                "params.groups, build_params.groups; drops list-only fields "
+                "(activePaidPackages, cardType, identification, specialOffers)."
+            ),
         ),
     ] = False,
     output: Annotated[str, typer.Option("--output", "-o")] = "-",
@@ -176,27 +238,21 @@ def search(
     retries: RetriesOpt = 4,
     timeout: TimeoutOpt = 30.0,
     proxy: ProxyOpt = None,
-    user_agent: UserAgentOpt = None,
 ) -> None:
-    """Run a paginated krisha search and emit one JSONL record per listing.
-
-    Defaults are conservative (2 concurrent requests, 1 s between starts)
-    to avoid IP bans. Raise --concurrency / lower --min-interval at your
-    own risk.
+    """Run a paginated search and emit one JSONL record per listing.
 
     Examples:
 
-        krisha search prodazha/kvartiry --city almaty --rooms 2 \\
+        krisha search sell.flat --region almaty --rooms 2 \\
             --price-from 20000000 --price-to 40000000 --pages 1-5
 
-        krisha search arenda/kvartiry --city astana --has-photo --pages all \\
-            --min-interval 2 --proxy http://user:pass@proxy:8080
+        krisha search rent.flat --region astana --has-photo --pages all
     """
-    if "/" not in target:
-        raise typer.BadParameter("TARGET must be '<section>/<category>'")
-    section, category = target.split("/", 1)
-    if section not in {"prodazha", "arenda"}:
-        raise typer.BadParameter("section must be 'prodazha' or 'arenda'")
+    floor_custom: list[int] = []
+    if floor_not_first:
+        floor_custom.append(1)
+    if floor_not_last:
+        floor_custom.append(2)
 
     for b in building or []:
         if b not in BUILDING_TYPES:
@@ -205,9 +261,9 @@ def search(
             )
 
     filters = SearchFilters(
-        section=section,
-        category=category,
-        city=city,
+        cat_id=_resolve_cat_id(category),
+        common_region_id=_resolve_region_id(region),
+        geo_ids=geo_id or [],
         rooms=rooms or [],
         price_from=price_from,
         price_to=price_to,
@@ -218,40 +274,44 @@ def search(
         floor_from=floor_from,
         floor_to=floor_to,
         building=building or [],
+        renovation=renovation or [],
+        floor_custom=floor_custom,
         has_photo=has_photo,
         new_build=new_build,
         from_owner=from_owner,
         from_agent=from_agent,
         mortgage=mortgage,
-        floor_not_first=floor_not_first,
-        floor_not_last=floor_not_last,
-        extra_das=_parse_das_overrides(das or []),
+        text=text,
+        extra=_parse_extras(extra or []),
     )
 
     start_page, end_page = _parse_pages(pages)
 
     async def run() -> int:
         emitted = 0
-        async with KrishaClient(
+        async with ApiClient(
             concurrency=concurrency,
             retries=retries,
             timeout=timeout,
             min_interval=min_interval,
             proxy=proxy,
-            user_agent=user_agent,
         ) as client:
-            first_url = filters.page_url(start_page)
-            html = await client.get_text(first_url)
-            cards = parse_listing_page(html, start_page)
+            api = KrishaApi(client)
 
+            first = await api.listing_search(
+                filters,
+                offset=(start_page - 1) * PAGE_SIZE,
+                limit=PAGE_SIZE,
+                order_by=order_by,
+                sort=sort,
+            )
             resolved_end = end_page
             if resolved_end is None:
-                total = parse_total_count(html)
                 resolved_end = (
-                    math.ceil(total / ADS_PER_PAGE) if total else start_page
+                    math.ceil(first.nb_total / PAGE_SIZE) if first.nb_total else start_page
                 )
                 print(
-                    f"[search] {total or '?'} matches; fetching pages "
+                    f"[search] {first.nb_total} matches; fetching pages "
                     f"{start_page}-{resolved_end} (concurrency={concurrency}, "
                     f"min-interval={min_interval}s)",
                     file=sys.stderr,
@@ -259,60 +319,131 @@ def search(
 
             with open_output(output) as out:
 
-                async def emit(card_records: list) -> int:
-                    """Write a page's cards (and, with --enrich, their /a/show records).
-
-                    All requests go through the same rate-limited client, so
-                    even with --enrich we don't burst N requests at once.
-                    """
-                    if enrich and card_records:
+                async def emit(envelope) -> int:
+                    ads = envelope.adverts()
+                    if enrich and ads:
                         details = await asyncio.gather(
-                            *(_show_one(client, c.id) for c in card_records),
+                            *(api.show(a.id) for a in ads),
                             return_exceptions=True,
                         )
                         n = 0
-                        for card, detail in zip(card_records, details):
+                        for ad, detail in zip(ads, details):
                             if isinstance(detail, Exception):
                                 print(
-                                    f"[enrich] id={card.id} error={detail!r}",
+                                    f"[enrich] id={ad.id} error={detail!r}",
                                     file=sys.stderr,
                                 )
-                                write_jsonl(out, card)
+                                write_jsonl(out, ad)
                             else:
-                                merged = {**detail.model_dump(mode="json"), "page": card.page}
-                                write_jsonl(out, merged)
+                                write_jsonl(out, detail)
                             n += 1
                         return n
-                    for c in card_records:
-                        write_jsonl(out, c)
-                    return len(card_records)
+                    for a in ads:
+                        write_jsonl(out, a)
+                    return len(ads)
 
-                emitted += await emit(cards)
+                emitted += await emit(first)
 
-                # Remaining pages — submitted concurrently but the client's
-                # global rate limiter still spaces them by --min-interval.
                 remaining = list(range(start_page + 1, resolved_end + 1))
                 if remaining:
-                    htmls = await asyncio.gather(
-                        *(client.get_text(filters.page_url(p)) for p in remaining),
+                    envelopes = await asyncio.gather(
+                        *(
+                            api.listing_search(
+                                filters,
+                                offset=(p - 1) * PAGE_SIZE,
+                                limit=PAGE_SIZE,
+                                order_by=order_by,
+                                sort=sort,
+                            )
+                            for p in remaining
+                        ),
                         return_exceptions=True,
                     )
-                    for p, page_html in zip(remaining, htmls):
-                        if isinstance(page_html, Exception):
-                            print(
-                                f"[search] page={p} error={page_html!r}",
-                                file=sys.stderr,
-                            )
+                    for p, env in zip(remaining, envelopes):
+                        if isinstance(env, Exception):
+                            print(f"[search] page={p} error={env!r}", file=sys.stderr)
                             continue
-                        page_cards = parse_listing_page(page_html, p)
-                        if not page_cards:
-                            continue
-                        emitted += await emit(page_cards)
+                        emitted += await emit(env)
 
         print(f"[search] emitted {emitted} records", file=sys.stderr)
         return 0 if emitted else 1
 
-    raise typer.Exit(asyncio.run(run()))
+    raise typer.Exit(_run(run()))
+
+
+@app.command()
+def phone(
+    ad_id: Annotated[int, typer.Argument(help="Krisha advert ID")],
+    output: Annotated[str, typer.Option("--output", "-o")] = "-",
+    min_interval: MinIntervalOpt = 1.0,
+    proxy: ProxyOpt = None,
+) -> None:
+    """Reveal the seller's phone number(s) for one advert."""
+
+    async def run() -> int:
+        async with ApiClient(
+            concurrency=1, min_interval=min_interval, proxy=proxy
+        ) as client:
+            api = KrishaApi(client)
+            phones = await api.phones(ad_id)
+            with open_output(output) as out:
+                write_jsonl(out, {"id": ad_id, "phones": phones.phones})
+        return 0
+
+    raise typer.Exit(_run(run()))
+
+
+@app.command()
+def views(
+    ad_ids: Annotated[
+        list[int],
+        typer.Argument(help="One or more advert IDs (batched 20 per call)."),
+    ],
+    output: Annotated[str, typer.Option("--output", "-o")] = "-",
+    min_interval: MinIntervalOpt = 1.0,
+    proxy: ProxyOpt = None,
+) -> None:
+    """Bulk view counts: emits {id, nb_views, nb_phone_views} per advert."""
+
+    async def run() -> int:
+        async with ApiClient(
+            concurrency=1, min_interval=min_interval, proxy=proxy
+        ) as client:
+            api = KrishaApi(client)
+            counts = await api.views(list(ad_ids))
+            with open_output(output) as out:
+                for ad_id in ad_ids:
+                    c = counts.get(ad_id)
+                    write_jsonl(
+                        out,
+                        {
+                            "id": ad_id,
+                            "nb_views": c.nb_views if c else None,
+                            "nb_phone_views": c.nb_phone_views if c else None,
+                        },
+                    )
+        return 0
+
+    raise typer.Exit(_run(run()))
+
+
+@app.command()
+def categories() -> None:
+    """List the category IDs accepted by `krisha search`."""
+    for name, cat_id in sorted(CATEGORY_IDS.items(), key=lambda x: x[1]):
+        typer.echo(f"  {cat_id:>3}  {name}")
+
+
+@app.command()
+def regions() -> None:
+    """List the region names accepted by `krisha search --region`.
+
+    The mobile API doesn't expose a name → id endpoint, so this list is a
+    hand-verified subset. To narrow by an ID not in the list, pass
+    `--geo-id N` directly.
+    """
+    for name, region_id in sorted(REGION_IDS.items(), key=lambda x: x[1]):
+        typer.echo(f"  {region_id:>3}  {name}")
 
 
 if __name__ == "__main__":
