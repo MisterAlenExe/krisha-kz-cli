@@ -1,11 +1,9 @@
-"""Filter → krisha URL mapping.
+"""DEPRECATED: web-URL filter mapping. See :mod:`krisha.api.search`.
 
-Listings live at:
-    /{section}/{category}/{city}/?das[KEY]=VALUE&page=N
-
-`das[...]` parameter names come from the search form on the live site
-(see PLAN.md for the full inventory). We expose a curated, typed subset
-and a `--das KEY=VALUE` escape hatch for the rest.
+Original purpose: build `/{section}/{category}/{city}/?das[KEY]=VALUE&page=N`
+URLs for the public website. The mobile API uses a different envelope
+(`query[data][KEY]=VALUE` + `catId`/`commonRegionId`) so this module is
+not used by the current CLI.
 """
 
 from __future__ import annotations

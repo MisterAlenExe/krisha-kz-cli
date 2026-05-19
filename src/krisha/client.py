@@ -1,3 +1,9 @@
+"""DEPRECATED: HTML-scraping client.
+
+Superseded by :mod:`krisha.api` after the krisha.kz mobile JSON API was
+reverse-engineered. Not wired into the CLI; kept on disk for reference.
+"""
+
 from __future__ import annotations
 
 import asyncio
