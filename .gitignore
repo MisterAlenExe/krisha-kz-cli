@@ -11,3 +11,4 @@ build/
 *.jsonl
 !tests/fixtures/*.jsonl
 uv.lock
+krisha-kz-openapi.yaml
